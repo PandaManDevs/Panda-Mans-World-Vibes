@@ -196,7 +196,7 @@ async def on_ready():
 async def main():
     async with bot:
         await bot.add_cog(Music(bot))
-        await bot.start('YOUR_DISCORD_BOT_TOKEN')
+        await bot.start('MTUzMzIwOTUxMzA5MDM1MTMyNg.GRmtpX.WvGI-wvsKB-ohlagNStJEeWGtsDGeGfTx82Zwc')
 
 if __name__ == '__main__':
     asyncio.run(main())
