@@ -1,57 +1,139 @@
-import asyncio
-import logging
 import os
 import re
-import shutil
+import sys
+import asyncio
+import logging
+import unicodedata
+from dataclasses import dataclass, field
 from typing import Optional
-from urllib.parse import quote, urlparse
-from urllib.request import Request, urlopen
 
 import discord
 from discord.ext import commands
 import yt_dlp
 
-# ------------------------------------------------------------
-# Panda Man's World Vibes - Discord Music Bot
-# Render-friendly version
+
+# ============================================================
+# PANDA MANS WORLD VIBES
+# Discord SoundCloud Music Bot
 #
-# IMPORTANT:
-# - Does NOT use Chrome cookies.
-# - Does NOT require the Spotify Web API for Spotify links.
-# - Spotify links are resolved to public metadata and then searched
-#   on SoundCloud only (Spotify links are searched on SoundCloud).
-# - Designed to run as a Render Background Worker.
-# ------------------------------------------------------------
+# SoundCloud ONLY
+# YouTube is intentionally disabled.
+#
+# Designed for Render + Python 3.11+
+# ============================================================
+
+
+# ============================================================
+# LOGGING
+# ============================================================
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    stream=sys.stdout,
 )
+
 logger = logging.getLogger("PandaMusicBot")
 
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-SOUNDCLOUD_CLIENT_ID = os.getenv("SOUNDCLOUD_CLIENT_ID")
 
-intents = discord.Intents.default()
-intents.message_content = True
-intents.voice_states = True
+# ============================================================
+# ENVIRONMENT
+# ============================================================
 
-bot = commands.Bot(
-    command_prefix="!",
-    intents=intents,
-    help_command=None,
+TOKEN = os.getenv("DISCORD_TOKEN") or os.getenv("TOKEN")
+
+if not TOKEN:
+    logger.critical(
+        "DISCORD_TOKEN/TOKEN environment variable is missing."
+    )
+    raise RuntimeError(
+        "Set DISCORD_TOKEN in your Render environment variables."
+    )
+
+
+SOUNDCLOUD_CLIENT_ID = os.getenv("SOUNDCLOUD_CLIENT_ID", "").strip()
+
+
+# ============================================================
+# FFMPEG
+# ============================================================
+
+FFMPEG_EXECUTABLE = os.getenv(
+    "FFMPEG_PATH",
+    "/usr/bin/ffmpeg",
 )
 
-# No cookiesfrombrowser / Chrome profile is used here.
+if not os.path.exists(FFMPEG_EXECUTABLE):
+    logger.warning(
+        "FFmpeg was not found at %s. "
+        "Trying the ffmpeg command from PATH.",
+        FFMPEG_EXECUTABLE,
+    )
+    FFMPEG_EXECUTABLE = "ffmpeg"
+
+
+# These options are important for SoundCloud HLS streams.
+#
+# SoundCloud frequently returns an m3u8/HLS stream instead of
+# a normal MP3 URL. The stream URL can also expire, which is
+# why the bot refreshes it immediately before playback.
+#
+FFMPEG_BEFORE_OPTIONS = (
+    "-reconnect 1 "
+    "-reconnect_streamed 1 "
+    "-reconnect_at_eof 1 "
+    "-reconnect_on_network_error 1 "
+    "-reconnect_on_http_error 4xx,5xx "
+    "-reconnect_delay_max 10 "
+    "-rw_timeout 30000000 "
+    "-http_persistent 0 "
+    "-protocol_whitelist file,http,https,tcp,tls,crypto "
+    "-user_agent "
+    "\"Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/139.0.0.0 Safari/537.36\""
+)
+
+FFMPEG_OPTIONS = (
+    "-vn "
+    "-sn "
+    "-dn "
+    "-loglevel warning "
+    "-af aresample=async=1"
+)
+
+
+# ============================================================
+# YT-DLP
+# ============================================================
+
 YTDL_OPTIONS = {
     "format": "bestaudio/best",
-    "noplaylist": True,
+
+    # Do not download the actual file.
+    "skip_download": True,
+
+    # Do not print a huge amount of output.
     "quiet": True,
     "no_warnings": True,
+
+    # SoundCloud extraction.
+    "extract_flat": False,
+
+    # Don't accidentally use YouTube.
+    "allowed_extractors": [
+        "soundcloud",
+    ],
+
+    # Network behavior.
     "socket_timeout": 30,
     "retries": 3,
     "fragment_retries": 3,
-    "extractor_retries": 3,
+
+    # Prefer AAC/HLS when SoundCloud provides it.
+    "concurrent_fragment_downloads": 1,
+
+    # HTTP headers.
     "http_headers": {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -62,672 +144,1416 @@ YTDL_OPTIONS = {
     },
 }
 
-# If Render has a SoundCloud client ID, let yt-dlp use it.
+
 if SOUNDCLOUD_CLIENT_ID:
-    YTDL_OPTIONS["extractor_args"] = {
-        "soundcloud": {
-            "client_id": [SOUNDCLOUD_CLIENT_ID],
-        }
-    }
-    logger.info("SoundCloud client ID loaded.")
+    logger.info(
+        "SOUNDCLOUD_CLIENT_ID is configured."
+    )
 else:
     logger.info(
-        "SOUNDCLOUD_CLIENT_ID is not set; using yt-dlp's normal "
-        "SoundCloud extraction."
+        "SOUNDCLOUD_CLIENT_ID is not set; "
+        "using yt-dlp's normal SoundCloud extraction."
     )
 
-ytdl = yt_dlp.YoutubeDL(YTDL_OPTIONS)
 
-# Audio streaming options. FFmpeg is installed by build.sh.
-FFMPEG_EXECUTABLE = shutil.which("ffmpeg") or "ffmpeg"
+# ============================================================
+# INTENTS
+# ============================================================
 
-# These options make FFmpeg handle expiring HTTP/HLS audio URLs much more
-# reliably on Render. The protocol whitelist is important for SoundCloud
-# HLS streams, which can reference multiple protocols internally.
-FFMPEG_BEFORE_OPTIONS = (
-    "-reconnect 1 "
-    "-reconnect_streamed 1 "
-    "-reconnect_at_eof 1 "
-    "-reconnect_on_network_error 1 "
-    "-reconnect_on_http_error 4xx,5xx "
-    "-reconnect_delay_max 5 "
-    "-protocol_whitelist file,http,https,tcp,tls,crypto"
+intents = discord.Intents.default()
+intents.message_content = True
+intents.voice_states = True
+
+
+# ============================================================
+# BOT
+# ============================================================
+
+bot = commands.Bot(
+    command_prefix="!",
+    intents=intents,
+    help_command=None,
 )
-FFMPEG_OPTIONS = "-vn -sn -dn -loglevel warning"
 
 
-def is_url(value: str) -> bool:
-    return value.startswith(("http://", "https://"))
+# ============================================================
+# MUSIC DATA
+# ============================================================
+
+@dataclass
+class Track:
+    title: str
+    webpage_url: str
+    stream_url: str
+    requested_by: discord.Member
+    duration: int = 0
+    thumbnail: Optional[str] = None
+    uploader: Optional[str] = None
+    data: dict = field(default_factory=dict)
 
 
-def is_spotify_url(value: str) -> bool:
-    return "open.spotify.com/" in value.lower() or "spotify.link/" in value.lower()
+@dataclass
+class GuildMusic:
+    queue: list[Track] = field(default_factory=list)
+
+    current: Optional[Track] = None
+
+    volume: float = 0.50
+
+    voice: Optional[discord.VoiceClient] = None
+
+    text_channel: Optional[discord.TextChannel] = None
+
+    playing: bool = False
 
 
-def is_soundcloud_url(value: str) -> bool:
-    return "soundcloud.com/" in value.lower()
+music: dict[int, GuildMusic] = {}
 
 
-def is_youtube_url(value: str) -> bool:
+# ============================================================
+# HELPERS
+# ============================================================
+
+def get_music(guild_id: int) -> GuildMusic:
+    if guild_id not in music:
+        music[guild_id] = GuildMusic()
+
+    return music[guild_id]
+
+
+def normalize_search(text: str) -> str:
+    """
+    Normalizes fancy Unicode text.
+
+    Example:
+        𝓟𝓪𝓷𝓭𝓪 𝓜𝓪𝓷’𝓼 𝓥𝓲𝓫𝓮𝓼 🎧
+
+    becomes approximately:
+
+        Panda Man's Vibes
+    """
+
+    if not text:
+        return ""
+
+    text = unicodedata.normalize(
+        "NFKC",
+        text,
+    )
+
+    text = text.replace(
+        "\u2019",
+        "'",
+    )
+
+    text = text.replace(
+        "\u2018",
+        "'",
+    )
+
+    text = text.replace(
+        "\u201c",
+        '"',
+    )
+
+    text = text.replace(
+        "\u201d",
+        '"',
+    )
+
+    # Remove emoji/symbol characters that often hurt search.
+    cleaned = []
+
+    for char in text:
+        category = unicodedata.category(char)
+
+        if category.startswith("So"):
+            continue
+
+        if category.startswith("Cs"):
+            continue
+
+        cleaned.append(char)
+
+    text = "".join(cleaned)
+
+    text = re.sub(
+        r"\s+",
+        " ",
+        text,
+    ).strip()
+
+    return text
+
+
+def is_url(text: str) -> bool:
+    return bool(
+        re.match(
+            r"^https?://",
+            text.strip(),
+            re.IGNORECASE,
+        )
+    )
+
+
+def is_soundcloud_url(text: str) -> bool:
+    return bool(
+        re.match(
+            r"^https?://(?:www\.)?soundcloud\.com/",
+            text.strip(),
+            re.IGNORECASE,
+        )
+    )
+
+
+def is_youtube_url(text: str) -> bool:
+    lowered = text.lower()
+
     return (
-        "youtube.com/" in value.lower()
-        or "youtu.be/" in value.lower()
-        or "music.youtube.com/" in value.lower()
+        "youtube.com" in lowered
+        or "youtu.be" in lowered
+        or "music.youtube.com" in lowered
     )
 
 
-def clean_spotify_title(title: str) -> str:
-    """Turn Spotify's public oEmbed title into a useful search string."""
-    title = re.sub(r"\s+", " ", title or "").strip()
-    title = re.sub(r"\s*\|\s*Spotify\s*$", "", title, flags=re.I)
-    title = re.sub(r"\s*-\s*Spotify\s*$", "", title, flags=re.I)
-    return title
+def format_duration(seconds: int) -> str:
+    if not seconds:
+        return "Unknown"
+
+    seconds = int(seconds)
+
+    minutes = seconds // 60
+    remaining = seconds % 60
+
+    if minutes >= 60:
+        hours = minutes // 60
+        minutes %= 60
+
+        return f"{hours}:{minutes:02d}:{remaining:02d}"
+
+    return f"{minutes}:{remaining:02d}"
 
 
-def spotify_metadata_sync(url: str) -> Optional[dict]:
+def truncate(text: str, length: int = 90) -> str:
+    if not text:
+        return ""
+
+    if len(text) <= length:
+        return text
+
+    return text[: length - 3] + "..."
+
+
+# ============================================================
+# YT-DLP EXTRACTION
+# ============================================================
+
+async def extract_info(url: str) -> Optional[dict]:
     """
-    Uses Spotify's public oEmbed endpoint instead of Spotipy.
-    This avoids the Spotify API 403 that the old bot was hitting.
+    Runs yt-dlp outside the asyncio event loop.
+
+    This prevents yt-dlp from blocking the Discord bot.
     """
-    endpoint = (
-        "https://open.spotify.com/oembed?url="
-        + quote(url, safe="")
-    )
-    request = Request(
-        endpoint,
-        headers={
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 Chrome/139 Safari/537.36"
-            )
-        },
-    )
-
-    with urlopen(request, timeout=15) as response:
-        import json
-
-        data = json.loads(response.read().decode("utf-8"))
-
-    title = clean_spotify_title(data.get("title", ""))
-    if not title:
-        return None
-
-    # Spotify oEmbed normally exposes the track title. Some responses
-    # expose author_name as well; use it when available.
-    author = (data.get("author_name") or "").strip()
-    search_text = f"{title} {author}".strip()
-
-    return {
-        "title": title,
-        "author": author,
-        "search": search_text,
-        "thumbnail": data.get("thumbnail_url"),
-    }
-
-
-async def resolve_spotify(url: str) -> dict:
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(
-        None,
-        lambda: spotify_metadata_sync(url),
-    )
-
-
-def extract_info_sync(query: str) -> dict:
-    return ytdl.extract_info(query, download=False)
-
-
-async def extract_info(query: str) -> dict:
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(
-        None,
-        lambda: extract_info_sync(query),
-    )
-
-
-async def search_source(search: str) -> dict:
-    """SoundCloud-only search and direct SoundCloud URL extraction."""
-    if is_url(search):
-        if is_youtube_url(search):
-            raise ValueError("YouTube is disabled. Please use a SoundCloud link.")
-        if not is_soundcloud_url(search):
-            raise ValueError("Only SoundCloud links are supported for direct URLs.")
-
-        data = await extract_info(search)
-        if data and data.get("entries"):
-            entries = [e for e in data["entries"] if e]
-            data = entries[0] if entries else None
-        if not data:
-            raise ValueError("No playable SoundCloud result was found.")
-        return data
-
-    logger.info("Searching SoundCloud: %s", search)
-    search_options = dict(YTDL_OPTIONS)
-    search_options["extract_flat"] = True
 
     loop = asyncio.get_running_loop()
 
-    def do_search():
-        with yt_dlp.YoutubeDL(search_options) as search_ytdl:
-            return search_ytdl.extract_info(
-                f"scsearch5:{search}",
+    options = dict(YTDL_OPTIONS)
+
+    if SOUNDCLOUD_CLIENT_ID:
+        options["extractor_args"] = {
+            "soundcloud": {
+                "client_id": [
+                    SOUNDCLOUD_CLIENT_ID
+                ]
+            }
+        }
+
+    def extract():
+        with yt_dlp.YoutubeDL(options) as ytdl:
+            return ytdl.extract_info(
+                url,
                 download=False,
             )
 
-    data = await loop.run_in_executor(None, do_search)
-    entries = [e for e in (data or {}).get("entries", []) if e]
-    if not entries:
-        raise ValueError(f"No SoundCloud results found for `{search}`.")
+    try:
+        return await loop.run_in_executor(
+            None,
+            extract,
+        )
 
-    # Search results can be flat metadata. Extract the selected SoundCloud
-    # page separately so yt-dlp gets a fresh, playable stream URL.
-    selected = entries[0]
-    track_url = (
-        selected.get("webpage_url")
-        or selected.get("original_url")
-        or selected.get("url")
+    except Exception:
+        logger.exception(
+            "yt-dlp extraction failed for: %s",
+            url,
+        )
+
+        raise
+
+
+# ============================================================
+# SOUNDCloud SEARCH
+# ============================================================
+
+async def search_soundcloud(search: str) -> Optional[dict]:
+    """
+    Search SoundCloud only.
+
+    YouTube is deliberately never used.
+    """
+
+    search = normalize_search(search)
+
+    if not search:
+        return None
+
+    logger.info(
+        "Searching SoundCloud: %s",
+        search,
     )
-    if not track_url or not is_soundcloud_url(track_url):
-        raise ValueError("SoundCloud search returned an invalid track URL.")
 
-    logger.info("Selected SoundCloud track: %s", track_url)
-    data = await extract_info(track_url)
-    if data and data.get("entries"):
-        entries = [e for e in data["entries"] if e]
-        data = entries[0] if entries else None
+    query = f"scsearch5:{search}"
+
+    try:
+        data = await extract_info(query)
+
+    except Exception:
+        logger.exception(
+            "SoundCloud search failed: %s",
+            search,
+        )
+        return None
+
     if not data:
-        raise ValueError("Could not extract the selected SoundCloud track.")
+        return None
+
+    entries = data.get("entries")
+
+    if not entries:
+        return None
+
+    entries = [
+        entry
+        for entry in entries
+        if entry
+        and entry.get("webpage_url")
+    ]
+
+    if not entries:
+        return None
+
+    # Prefer entries with an actual audio URL.
+    playable = [
+        entry
+        for entry in entries
+        if entry.get("url")
+    ]
+
+    if playable:
+        selected = playable[0]
+    else:
+        selected = entries[0]
+
+    logger.info(
+        "Selected SoundCloud track: %s",
+        selected.get("webpage_url"),
+    )
+
+    return selected
+
+
+# ============================================================
+# SEARCH SOURCE
+# ============================================================
+
+async def search_source(search: str) -> Optional[dict]:
+    """
+    SoundCloud-only source resolver.
+
+    YouTube URLs are rejected.
+    """
+
+    search = search.strip()
+
+    if not search:
+        raise ValueError(
+            "Please provide a SoundCloud URL or search term."
+        )
+
+    if is_youtube_url(search):
+        raise ValueError(
+            "YouTube is disabled. "
+            "Please use a SoundCloud song or SoundCloud URL."
+        )
+
+    # Direct SoundCloud URL.
+    if is_url(search):
+
+        if not is_soundcloud_url(search):
+            raise ValueError(
+                "Only SoundCloud URLs are supported."
+            )
+
+        logger.info(
+            "Resolving SoundCloud URL: %s",
+            search,
+        )
+
+        data = await extract_info(search)
+
+        if not data:
+            raise ValueError(
+                "SoundCloud did not return track information."
+            )
+
+        # Handle SoundCloud playlists/sets.
+        entries = data.get("entries")
+
+        if entries:
+            entries = [
+                entry
+                for entry in entries
+                if entry
+            ]
+
+            if entries:
+                return entries[0]
+
+        return data
+
+    # Normal SoundCloud search.
+    data = await search_soundcloud(search)
+
+    if not data:
+        raise ValueError(
+            f"No SoundCloud results found for `{search}`."
+        )
+
     return data
 
 
-class Track:
-    def __init__(self, data: dict, requested_by: discord.Member):
-        self.data = data
-        self.requested_by = requested_by
+# ============================================================
+# TRACK CREATION
+# ============================================================
 
-        self.title = data.get("title") or "Unknown title"
-        self.webpage_url = data.get("webpage_url") or data.get("original_url") or ""
-        self.duration = data.get("duration") or 0
-        self.uploader = data.get("uploader") or data.get("channel") or "Unknown"
-        self.source_name = self._source_name()
+def make_track(
+    data: dict,
+    requested_by: discord.Member,
+) -> Track:
 
-    def _source_name(self) -> str:
-        url = self.webpage_url.lower()
-        extractor = str(self.data.get("extractor_key") or self.data.get("extractor") or "").lower()
+    webpage_url = (
+        data.get("webpage_url")
+        or data.get("original_url")
+        or ""
+    )
 
-        if "soundcloud" in url or "soundcloud" in extractor:
-            return "SoundCloud"
-        if "youtube" in url or "youtube" in extractor:
-            return "YouTube"
-        return "Audio"
+    stream_url = data.get("url") or ""
 
-    @property
-    def duration_text(self) -> str:
-        if not self.duration:
-            return "Unknown"
+    title = (
+        data.get("title")
+        or "Unknown SoundCloud Track"
+    )
 
-        seconds = int(self.duration)
-        minutes, seconds = divmod(seconds, 60)
-        hours, minutes = divmod(minutes, 60)
+    duration = int(
+        data.get("duration")
+        or 0
+    )
 
-        if hours:
-            return f"{hours}:{minutes:02d}:{seconds:02d}"
-        return f"{minutes}:{seconds:02d}"
+    thumbnail = data.get(
+        "thumbnail"
+    )
+
+    uploader = (
+        data.get("uploader")
+        or data.get("artist")
+        or data.get("creator")
+    )
+
+    return Track(
+        title=title,
+        webpage_url=webpage_url,
+        stream_url=stream_url,
+        requested_by=requested_by,
+        duration=duration,
+        thumbnail=thumbnail,
+        uploader=uploader,
+        data=data,
+    )
 
 
-class Music(commands.Cog):
-    def __init__(self, bot_: commands.Bot):
-        self.bot = bot_
-        # One queue per guild.
-        self.queues: dict[int, list[Track]] = {}
-        self.now_playing: dict[int, Optional[Track]] = {}
-        self.volumes: dict[int, float] = {}
-        self.next_locks: dict[int, asyncio.Lock] = {}
+# ============================================================
+# REFRESH SOUNDCloud STREAM
+# ============================================================
 
-    def get_queue(self, guild_id: int) -> list[Track]:
-        return self.queues.setdefault(guild_id, [])
+async def refresh_track(track: Track) -> Track:
+    """
+    SoundCloud stream URLs can expire.
 
-    def get_lock(self, guild_id: int) -> asyncio.Lock:
-        return self.next_locks.setdefault(guild_id, asyncio.Lock())
+    We resolve the public SoundCloud page again immediately
+    before playback so FFmpeg gets a fresh URL.
+    """
 
-    async def ensure_voice(self, ctx: commands.Context) -> Optional[discord.VoiceClient]:
-        if not ctx.guild:
-            await ctx.send("❌ This command can only be used in a server.")
-            return None
+    if not track.webpage_url:
+        raise RuntimeError(
+            "This track does not have a SoundCloud page URL."
+        )
 
-        if not ctx.author.voice or not ctx.author.voice.channel:
-            await ctx.send("❌ Join a voice channel first.")
-            return None
+    logger.info(
+        "Refreshing SoundCloud stream: %s",
+        track.webpage_url,
+    )
 
-        target = ctx.author.voice.channel
-        voice = ctx.voice_client
+    fresh_data = await extract_info(
+        track.webpage_url
+    )
 
-        if voice is None:
-            try:
-                logger.info(
-                    "Connecting to voice: guild=%s channel=%s",
-                    ctx.guild.id,
-                    target.id,
+    if not fresh_data:
+        raise RuntimeError(
+            "SoundCloud returned no data when "
+            "refreshing the track."
+        )
+
+    # If a set/playlist somehow gets returned, use the first
+    # valid entry.
+    entries = fresh_data.get("entries")
+
+    if entries:
+        entries = [
+            entry
+            for entry in entries
+            if entry
+        ]
+
+        if entries:
+            fresh_data = entries[0]
+
+    fresh_url = fresh_data.get("url")
+
+    if not fresh_url:
+        raise RuntimeError(
+            "SoundCloud did not return a playable "
+            "audio stream."
+        )
+
+    track.stream_url = fresh_url
+    track.data = fresh_data
+
+    if fresh_data.get("title"):
+        track.title = fresh_data["title"]
+
+    if fresh_data.get("duration"):
+        track.duration = int(
+            fresh_data["duration"]
+        )
+
+    if fresh_data.get("thumbnail"):
+        track.thumbnail = fresh_data[
+            "thumbnail"
+        ]
+
+    logger.info(
+        "Fresh SoundCloud stream obtained for: %s",
+        track.title,
+    )
+
+    return track
+
+
+# ============================================================
+# MAKE FFMPEG SOURCE
+# ============================================================
+
+async def make_source(
+    state: GuildMusic,
+    track: Track,
+) -> discord.AudioSource:
+
+    # Always refresh.
+    track = await refresh_track(
+        track
+    )
+
+    direct_url = track.stream_url
+
+    if not direct_url:
+        raise RuntimeError(
+            "SoundCloud returned an empty stream URL."
+        )
+
+    logger.info(
+        "Starting FFmpeg playback: "
+        "guild=%s source=SoundCloud title=%s",
+        track.requested_by.guild.id,
+        track.title,
+    )
+
+    logger.info(
+        "SoundCloud stream URL begins with: %s",
+        direct_url[:180],
+    )
+
+    source = discord.FFmpegPCMAudio(
+        direct_url,
+        executable=FFMPEG_EXECUTABLE,
+        before_options=FFMPEG_BEFORE_OPTIONS,
+        options=FFMPEG_OPTIONS,
+    )
+
+    transformed = discord.PCMVolumeTransformer(
+        source,
+        volume=state.volume,
+    )
+
+    return transformed
+
+
+# ============================================================
+# PLAY NEXT
+# ============================================================
+
+async def play_next(
+    guild: discord.Guild,
+) -> None:
+
+    state = get_music(
+        guild.id
+    )
+
+    voice = guild.voice_client
+
+    if not voice:
+        state.playing = False
+        state.current = None
+        return
+
+    if not state.queue:
+        state.playing = False
+        state.current = None
+
+        try:
+            if state.text_channel:
+                await state.text_channel.send(
+                    "⏹️ Queue finished."
                 )
-                voice = await target.connect(
-                    timeout=30,
-                    reconnect=True,
+        except Exception:
+            pass
+
+        return
+
+    track = state.queue.pop(0)
+
+    state.current = track
+    state.playing = True
+
+    try:
+        source = await make_source(
+            state,
+            track,
+        )
+
+    except Exception as exc:
+        logger.exception(
+            "Could not create audio source."
+        )
+
+        try:
+            if state.text_channel:
+                await state.text_channel.send(
+                    "❌ I couldn't play that SoundCloud track.\n"
+                    f"```{truncate(str(exc), 500)}```"
                 )
-                return voice
-            except Exception as exc:
-                logger.exception("Voice connection failed")
-                await ctx.send(f"❌ I couldn't join the voice channel: `{exc}`")
-                return None
+        except Exception:
+            pass
 
-        # Move if the user is in a different channel.
-        if voice.channel and voice.channel.id != target.id:
-            try:
-                await voice.move_to(target)
-            except Exception as exc:
-                logger.exception("Voice move failed")
-                await ctx.send(f"❌ I couldn't move voice channels: `{exc}`")
-                return None
+        state.current = None
+        state.playing = False
 
-        # If Discord dropped the voice connection, reconnect it.
-        if not voice.is_connected():
-            try:
-                await voice.disconnect(force=True)
-            except Exception:
-                pass
+        # Try the next track automatically.
+        if state.queue:
+            await asyncio.sleep(1)
+            await play_next(guild)
 
-            try:
-                voice = await target.connect(
-                    timeout=30,
-                    reconnect=True,
+        return
+
+    def after_play(error):
+        if error:
+            logger.error(
+                "FFmpeg playback error: %s",
+                error,
+            )
+
+        future = asyncio.run_coroutine_threadsafe(
+            handle_track_finished(guild),
+            bot.loop,
+        )
+
+        try:
+            future.result()
+        except Exception:
+            logger.exception(
+                "Error finishing track."
+            )
+
+    try:
+        voice.play(
+            source,
+            after=after_play,
+        )
+
+    except Exception:
+        logger.exception(
+            "Discord voice.play() failed."
+        )
+
+        try:
+            source.cleanup()
+        except Exception:
+            pass
+
+        state.current = None
+        state.playing = False
+
+        if state.queue:
+            await asyncio.sleep(1)
+            await play_next(guild)
+
+        return
+
+    logger.info(
+        "Now playing: %s",
+        track.title,
+    )
+
+    try:
+        if state.text_channel:
+            embed = discord.Embed(
+                title="🎵 Now Playing",
+                description=(
+                    f"**{track.title}**"
+                ),
+                color=0xFF5500,
+            )
+
+            if track.uploader:
+                embed.add_field(
+                    name="Artist",
+                    value=truncate(
+                        track.uploader,
+                        100,
+                    ),
+                    inline=True,
                 )
-                return voice
-            except Exception as exc:
-                logger.exception("Voice reconnect failed")
-                await ctx.send(f"❌ Voice reconnect failed: `{exc}`")
-                return None
+
+            if track.duration:
+                embed.add_field(
+                    name="Duration",
+                    value=format_duration(
+                        track.duration
+                    ),
+                    inline=True,
+                )
+
+            embed.add_field(
+                name="Requested by",
+                value=track.requested_by.mention,
+                inline=True,
+            )
+
+            if track.webpage_url:
+                embed.add_field(
+                    name="SoundCloud",
+                    value=track.webpage_url,
+                    inline=False,
+                )
+
+            if track.thumbnail:
+                embed.set_thumbnail(
+                    url=track.thumbnail
+                )
+
+            await state.text_channel.send(
+                embed=embed
+            )
+
+    except Exception:
+        logger.exception(
+            "Could not send now-playing message."
+        )
+
+
+async def handle_track_finished(
+    guild: discord.Guild,
+) -> None:
+
+    state = get_music(
+        guild.id
+    )
+
+    state.current = None
+    state.playing = False
+
+    await asyncio.sleep(0.5)
+
+    voice = guild.voice_client
+
+    if not voice:
+        return
+
+    if state.queue:
+        await play_next(guild)
+
+
+# ============================================================
+# VOICE CONNECT
+# ============================================================
+
+async def connect_to_user_channel(
+    ctx: commands.Context,
+) -> discord.VoiceClient:
+
+    if not ctx.author.voice:
+        raise RuntimeError(
+            "You need to join a voice channel first."
+        )
+
+    channel = ctx.author.voice.channel
+
+    permissions = channel.permissions_for(
+        ctx.guild.me
+    )
+
+    if not permissions.connect:
+        raise RuntimeError(
+            "I don't have permission to connect "
+            "to that voice channel."
+        )
+
+    if not permissions.speak:
+        raise RuntimeError(
+            "I don't have permission to speak "
+            "in that voice channel."
+        )
+
+    voice = ctx.guild.voice_client
+
+    if voice:
+
+        if voice.channel.id != channel.id:
+            await voice.move_to(channel)
 
         return voice
 
-    async def make_source(self, track: Track) -> discord.AudioSource:
-        if not is_soundcloud_url(track.webpage_url):
-            raise ValueError("This bot only plays SoundCloud audio.")
+    logger.info(
+        "Connecting to voice: "
+        "guild=%s channel=%s",
+        ctx.guild.id,
+        channel.id,
+    )
 
-        # SoundCloud stream URLs can expire, so always refresh the track
-        # before handing the URL to FFmpeg.
-        data = await extract_info(track.webpage_url)
-        if data and data.get("entries"):
-            entries = [e for e in data["entries"] if e]
-            data = entries[0] if entries else None
-
-        if not data:
-            raise ValueError("SoundCloud returned no track data.")
-
-        direct_url = data.get("url")
-        if not direct_url:
-            raise ValueError("SoundCloud did not provide a playable audio URL.")
-
-        track.data = data
-        track.title = data.get("title") or track.title or "Unknown title"
-        track.webpage_url = data.get("webpage_url") or track.webpage_url
-        track.duration = data.get("duration") or track.duration or 0
-        track.uploader = data.get("uploader") or data.get("channel") or track.uploader or "Unknown"
-        track.source_name = "SoundCloud"
-
-        logger.info(
-            "Starting FFmpeg playback: guild=%s source=SoundCloud url=%s",
-            track.requested_by.guild.id,
-            direct_url[:180],
+    try:
+        voice = await channel.connect(
+            reconnect=True
         )
 
-        source = discord.FFmpegPCMAudio(
-            direct_url,
-            executable=FFMPEG_EXECUTABLE,
-            before_options=FFMPEG_BEFORE_OPTIONS,
-            options=FFMPEG_OPTIONS,
+    except Exception:
+        logger.exception(
+            "Voice connection failed."
+        )
+        raise
+
+    state = get_music(
+        ctx.guild.id
+    )
+
+    state.voice = voice
+
+    logger.info(
+        "Voice connection complete: "
+        "guild=%s channel=%s",
+        ctx.guild.id,
+        channel.id,
+    )
+
+    return voice
+
+
+# ============================================================
+# PLAY COMMAND
+# ============================================================
+
+@bot.command(name="play")
+async def play(
+    ctx: commands.Context,
+    *,
+    search: str,
+):
+    """
+    !play <SoundCloud URL or search>
+    """
+
+    if not ctx.guild:
+        await ctx.send(
+            "❌ This command can only be used in a server."
+        )
+        return
+
+    state = get_music(
+        ctx.guild.id
+    )
+
+    state.text_channel = ctx.channel
+
+    # Connect first.
+    try:
+        voice = await connect_to_user_channel(
+            ctx
         )
 
-        return discord.PCMVolumeTransformer(
-            source,
-            volume=self.volumes.get(track.requested_by.guild.id, 0.5),
+    except Exception as exc:
+        await ctx.send(
+            "❌ I couldn't join the voice channel:\n"
+            f"```{truncate(str(exc), 500)}```"
+        )
+        return
+
+    # Resolve SoundCloud.
+    try:
+        search = normalize_search(
+            search
         )
 
-
-    async def play_next(self, guild: discord.Guild, channel: discord.abc.Messageable):
-        guild_id = guild.id
-        lock = self.get_lock(guild_id)
-
-        async with lock:
-            queue = self.get_queue(guild_id)
-            voice = guild.voice_client
-
-            if voice is None or not voice.is_connected():
-                self.now_playing[guild_id] = None
-                return
-
-            while queue:
-                track = queue.pop(0)
-                self.now_playing[guild_id] = track
-
-                try:
-                    source = await self.make_source(track)
-
-                    def after_playback(error: Optional[Exception]):
-                        if error:
-                            logger.error(
-                                "Playback error in guild %s: %s",
-                                guild_id,
-                                error,
-                            )
-
-                        future = asyncio.run_coroutine_threadsafe(
-                            self.play_next(guild, channel),
-                            self.bot.loop,
-                        )
-
-                        def done_callback(done_future):
-                            try:
-                                done_future.result()
-                            except Exception:
-                                logger.exception(
-                                    "Error advancing queue in guild %s",
-                                    guild_id,
-                                )
-
-                        future.add_done_callback(done_callback)
-
-                    voice.play(source, after=after_playback)
-
-                    embed = discord.Embed(
-                        title="🎵 Now Playing",
-                        description=f"**{track.title}**",
-                        color=discord.Color.green(),
-                    )
-                    embed.add_field(
-                        name="Artist / Uploader",
-                        value=track.uploader[:1024],
-                        inline=True,
-                    )
-                    embed.add_field(
-                        name="Duration",
-                        value=track.duration_text,
-                        inline=True,
-                    )
-                    embed.add_field(
-                        name="Source",
-                        value=track.source_name,
-                        inline=True,
-                    )
-                    embed.set_footer(
-                        text=f"Requested by {track.requested_by.display_name}"
-                    )
-
-                    await channel.send(embed=embed)
-                    return
-
-                except Exception as exc:
-                    logger.exception(
-                        "Could not play '%s' in guild %s",
-                        track.title,
-                        guild_id,
-                    )
-                    try:
-                        await channel.send(
-                            f"❌ Couldn't play **{track.title}**. Skipping it.\n"
-                            f"`{str(exc)[:900]}`"
-                        )
-                    except Exception:
-                        pass
-
-            self.now_playing[guild_id] = None
-
-    @commands.command(name="play", help="Play a SoundCloud song or Spotify link")
-    async def play(self, ctx: commands.Context, *, search: str):
-        voice = await self.ensure_voice(ctx)
-        if voice is None:
+        # Prevent YouTube.
+        if is_youtube_url(search):
+            await ctx.send(
+                "❌ YouTube is disabled.\n"
+                "Please use a **SoundCloud** song or URL."
+            )
             return
 
         async with ctx.typing():
-            try:
-                original = search.strip()
-
-                # Spotify: public oEmbed metadata -> search on SoundCloud only.
-                if is_spotify_url(original):
-                    logger.info("Resolving Spotify link: %s", original)
-                    try:
-                        spotify = await resolve_spotify(original)
-                    except Exception as exc:
-                        logger.warning("Spotify oEmbed failed: %s", exc)
-                        await ctx.send(
-                            "❌ I couldn't read that Spotify link. "
-                            "Try the song name and artist instead."
-                        )
-                        return
-
-                    if not spotify or not spotify.get("search"):
-                        await ctx.send(
-                            "❌ Spotify didn't provide enough public information "
-                            "to find that track."
-                        )
-                        return
-
-                    search_text = spotify["search"]
-                    data = await search_source(search_text)
-
-                else:
-                    if is_youtube_url(original):
-                        await ctx.send("❌ YouTube is disabled. Please use SoundCloud.")
-                        return
-                    data = await search_source(original)
-
-                if data.get("entries"):
-                    data = next(
-                        (entry for entry in data["entries"] if entry),
-                        None,
-                    )
-
-                if not data:
-                    await ctx.send("❌ I couldn't find that song.")
-                    return
-
-                track = Track(data, ctx.author)
-                queue = self.get_queue(ctx.guild.id)
-
-                if voice.is_playing() or voice.is_paused() or self.now_playing.get(ctx.guild.id):
-                    queue.append(track)
-
-                    embed = discord.Embed(
-                        title="⏳ Added to Queue",
-                        description=f"**{track.title}**",
-                        color=discord.Color.blurple(),
-                    )
-                    embed.add_field(
-                        name="Position",
-                        value=f"#{len(queue)}",
-                        inline=True,
-                    )
-                    embed.add_field(
-                        name="Source",
-                        value=track.source_name,
-                        inline=True,
-                    )
-                    await ctx.send(embed=embed)
-                else:
-                    # Keep the resolved track in the queue and let the
-                    # normal queue runner start it.
-                    queue.append(track)
-                    await self.play_next(ctx.guild, ctx.channel)
-
-            except Exception as exc:
-                logger.exception("Play command error")
-                await ctx.send(
-                    "❌ **Couldn't play that track.**\n"
-                    f"`{str(exc)[:1200]}`"
-                )
-
-    @commands.command(name="skip", help="Skip the current song")
-    async def skip(self, ctx: commands.Context):
-        voice = ctx.voice_client
-        if voice and (voice.is_playing() or voice.is_paused()):
-            voice.stop()
-            await ctx.send("⏭️ Skipped!")
-        else:
-            await ctx.send("❌ Nothing is playing.")
-
-    @commands.command(name="pause", help="Pause playback")
-    async def pause(self, ctx: commands.Context):
-        voice = ctx.voice_client
-        if voice and voice.is_playing():
-            voice.pause()
-            await ctx.send("⏸️ Paused!")
-        else:
-            await ctx.send("❌ Nothing is playing.")
-
-    @commands.command(name="resume", help="Resume playback")
-    async def resume(self, ctx: commands.Context):
-        voice = ctx.voice_client
-        if voice and voice.is_paused():
-            voice.resume()
-            await ctx.send("▶️ Resumed!")
-        else:
-            await ctx.send("❌ Nothing is paused.")
-
-    @commands.command(name="stop", help="Stop music and clear the queue")
-    async def stop(self, ctx: commands.Context):
-        guild_id = ctx.guild.id
-        self.get_queue(guild_id).clear()
-        self.now_playing[guild_id] = None
-
-        if ctx.voice_client:
-            ctx.voice_client.stop()
-
-        await ctx.send("⏹️ Stopped and cleared the queue.")
-
-    @commands.command(name="queue", help="Show the music queue")
-    async def queue_cmd(self, ctx: commands.Context):
-        guild_id = ctx.guild.id
-        queue = self.get_queue(guild_id)
-        current = self.now_playing.get(guild_id)
-
-        if not current and not queue:
-            await ctx.send("❌ The queue is empty.")
-            return
-
-        embed = discord.Embed(
-            title="🎵 Music Queue",
-            color=discord.Color.purple(),
-        )
-
-        if current:
-            embed.add_field(
-                name="▶️ Now Playing",
-                value=f"**{current.title}**\n{current.source_name}",
-                inline=False,
+            data = await search_source(
+                search
             )
 
-        if queue:
-            lines = []
-            for index, track in enumerate(queue[:10], 1):
-                lines.append(f"**{index}.** {track.title}")
-
-            embed.add_field(
-                name=f"⏳ Up Next ({len(queue)})",
-                value="\n".join(lines),
-                inline=False,
+        if not data:
+            raise ValueError(
+                "No SoundCloud result was found."
             )
 
-            if len(queue) > 10:
-                embed.set_footer(
-                    text=f"+ {len(queue) - 10} more song(s)"
-                )
-
-        await ctx.send(embed=embed)
-
-    @commands.command(name="volume", help="Set volume from 0 to 100")
-    async def volume(self, ctx: commands.Context, vol: int):
-        if not 0 <= vol <= 100:
-            await ctx.send("❌ Volume must be between 0 and 100.")
-            return
-
-        self.volumes[ctx.guild.id] = vol / 100
-
-        if ctx.voice_client and isinstance(
-            ctx.voice_client.source,
-            discord.PCMVolumeTransformer,
-        ):
-            ctx.voice_client.source.volume = vol / 100
-
-        await ctx.send(f"🔊 Volume set to **{vol}%**.")
-
-    @commands.command(name="leave", help="Leave the voice channel")
-    async def leave(self, ctx: commands.Context):
-        guild_id = ctx.guild.id
-        self.get_queue(guild_id).clear()
-        self.now_playing[guild_id] = None
-
-        if ctx.voice_client:
-            try:
-                await ctx.voice_client.disconnect(force=True)
-            except Exception:
-                logger.exception("Voice disconnect failed")
-
-            await ctx.send("👋 Left the voice channel.")
-        else:
-            await ctx.send("❌ I'm not in a voice channel.")
-
-    @commands.command(name="help", help="Show music commands")
-    async def help_cmd(self, ctx: commands.Context):
-        embed = discord.Embed(
-            title="🐼 Panda Man's World Vibes",
-            description="Music commands",
-            color=discord.Color.blurple(),
+        track = make_track(
+            data,
+            ctx.author,
         )
+
+    except Exception as exc:
+        logger.exception(
+            "Play command search error."
+        )
+
+        await ctx.send(
+            "❌ Couldn't find that SoundCloud track.\n"
+            f"```{truncate(str(exc), 700)}```"
+        )
+        return
+
+    # Put in queue.
+    state.queue.append(
+        track
+    )
+
+    position = len(
+        state.queue
+    )
+
+    # If something is already playing, just queue it.
+    if voice.is_playing() or voice.is_paused():
+        embed = discord.Embed(
+            title="📥 Added to Queue",
+            description=(
+                f"**{track.title}**"
+            ),
+            color=0xFF5500,
+        )
+
         embed.add_field(
-            name="🎵 Playback",
+            name="Position",
+            value=str(position),
+            inline=True,
+        )
+
+        if track.duration:
+            embed.add_field(
+                name="Duration",
+                value=format_duration(
+                    track.duration
+                ),
+                inline=True,
+            )
+
+        await ctx.send(
+            embed=embed
+        )
+
+        return
+
+    # Nothing is playing.
+    await ctx.send(
+        f"🔎 Found **{track.title}** on SoundCloud.\n"
+        "▶️ Starting playback..."
+    )
+
+    await play_next(
+        ctx.guild
+    )
+
+
+# ============================================================
+# SKIP
+# ============================================================
+
+@bot.command(name="skip")
+async def skip(
+    ctx: commands.Context,
+):
+    state = get_music(
+        ctx.guild.id
+    )
+
+    voice = ctx.guild.voice_client
+
+    if not voice or not voice.is_playing():
+        await ctx.send(
+            "❌ Nothing is currently playing."
+        )
+        return
+
+    voice.stop()
+
+    await ctx.send(
+        "⏭️ Skipped the current track."
+    )
+
+
+# ============================================================
+# PAUSE
+# ============================================================
+
+@bot.command(name="pause")
+async def pause(
+    ctx: commands.Context,
+):
+    voice = ctx.guild.voice_client
+
+    if not voice or not voice.is_playing():
+        await ctx.send(
+            "❌ Nothing is currently playing."
+        )
+        return
+
+    voice.pause()
+
+    await ctx.send(
+        "⏸️ Music paused."
+    )
+
+
+# ============================================================
+# RESUME
+# ============================================================
+
+@bot.command(name="resume")
+async def resume(
+    ctx: commands.Context,
+):
+    voice = ctx.guild.voice_client
+
+    if not voice or not voice.is_paused():
+        await ctx.send(
+            "❌ Music isn't paused."
+        )
+        return
+
+    voice.resume()
+
+    await ctx.send(
+        "▶️ Music resumed."
+    )
+
+
+# ============================================================
+# STOP
+# ============================================================
+
+@bot.command(name="stop")
+async def stop(
+    ctx: commands.Context,
+):
+    state = get_music(
+        ctx.guild.id
+    )
+
+    voice = ctx.guild.voice_client
+
+    state.queue.clear()
+    state.current = None
+    state.playing = False
+
+    if voice and (
+        voice.is_playing()
+        or voice.is_paused()
+    ):
+        voice.stop()
+
+    await ctx.send(
+        "⏹️ Stopped music and cleared the queue."
+    )
+
+
+# ============================================================
+# QUEUE
+# ============================================================
+
+@bot.command(name="queue")
+async def queue_command(
+    ctx: commands.Context,
+):
+    state = get_music(
+        ctx.guild.id
+    )
+
+    embed = discord.Embed(
+        title="🎵 Panda Music Queue",
+        color=0xFF5500,
+    )
+
+    if state.current:
+        embed.add_field(
+            name="▶️ Now Playing",
             value=(
-                "`!play <song / URL>`\n"
-                "`!skip`\n"
-                "`!pause`\n"
-                "`!resume`\n"
-                "`!stop`"
+                f"**{truncate(state.current.title, 70)}**"
             ),
             inline=False,
         )
-        embed.add_field(
-            name="📋 Queue",
-            value="`!queue`",
-            inline=True,
-        )
-        embed.add_field(
-            name="🔊 Audio",
-            value="`!volume <0-100>`",
-            inline=True,
-        )
-        embed.add_field(
-            name="🚪 Voice",
-            value="`!leave`",
-            inline=True,
-        )
-        await ctx.send(embed=embed)
 
+    if not state.queue:
+        if not state.current:
+            embed.description = (
+                "The queue is empty."
+            )
+
+        await ctx.send(
+            embed=embed
+        )
+        return
+
+    lines = []
+
+    for index, track in enumerate(
+        state.queue[:15],
+        start=1,
+    ):
+        duration = ""
+
+        if track.duration:
+            duration = (
+                f" — {format_duration(track.duration)}"
+            )
+
+        lines.append(
+            f"`{index}.` "
+            f"**{truncate(track.title, 65)}**"
+            f"{duration}"
+        )
+
+    if len(state.queue) > 15:
+        lines.append(
+            f"\n...and "
+            f"{len(state.queue) - 15} more."
+        )
+
+    embed.add_field(
+        name="📋 Up Next",
+        value="\n".join(lines),
+        inline=False,
+    )
+
+    await ctx.send(
+        embed=embed
+    )
+
+
+# ============================================================
+# VOLUME
+# ============================================================
+
+@bot.command(name="volume")
+async def volume(
+    ctx: commands.Context,
+    amount: int,
+):
+    if amount < 0 or amount > 100:
+        await ctx.send(
+            "❌ Volume must be between 0 and 100."
+        )
+        return
+
+    state = get_music(
+        ctx.guild.id
+    )
+
+    state.volume = amount / 100.0
+
+    voice = ctx.guild.voice_client
+
+    if voice and voice.source:
+        source = voice.source
+
+        if isinstance(
+            source,
+            discord.PCMVolumeTransformer,
+        ):
+            source.volume = state.volume
+
+    await ctx.send(
+        f"🔊 Volume set to **{amount}%**."
+    )
+
+
+# ============================================================
+# LEAVE
+# ============================================================
+
+@bot.command(name="leave")
+async def leave(
+    ctx: commands.Context,
+):
+    state = get_music(
+        ctx.guild.id
+    )
+
+    voice = ctx.guild.voice_client
+
+    state.queue.clear()
+    state.current = None
+    state.playing = False
+
+    if not voice:
+        await ctx.send(
+            "❌ I'm not in a voice channel."
+        )
+        return
+
+    try:
+        if voice.is_playing() or voice.is_paused():
+            voice.stop()
+
+        await voice.disconnect(
+            force=True
+        )
+
+    except Exception:
+        logger.exception(
+            "Error disconnecting voice."
+        )
+
+    state.voice = None
+
+    await ctx.send(
+        "👋 Left the voice channel and cleared the queue."
+    )
+
+
+# ============================================================
+# HELP
+# ============================================================
+
+@bot.command(name="help")
+async def help_command(
+    ctx: commands.Context,
+):
+    embed = discord.Embed(
+        title="🐼 Panda Mans World Vibes",
+        description=(
+            "🎵 **SoundCloud Music Bot**\n\n"
+            "YouTube playback is disabled. "
+            "Use SoundCloud links or search terms."
+        ),
+        color=0xFF5500,
+    )
+
+    embed.add_field(
+        name="🎵 Music",
+        value=(
+            "`!play <song>`\n"
+            "`!play <SoundCloud URL>`\n"
+            "`!skip`\n"
+            "`!pause`\n"
+            "`!resume`\n"
+            "`!stop`"
+        ),
+        inline=True,
+    )
+
+    embed.add_field(
+        name="📋 Queue",
+        value=(
+            "`!queue`\n"
+            "`!volume <0-100>`\n"
+            "`!leave`"
+        ),
+        inline=True,
+    )
+
+    embed.add_field(
+        name="🔊 Example",
+        value=(
+            "`!play Panda Man Vibes`\n"
+            "`!play https://soundcloud.com/...`"
+        ),
+        inline=False,
+    )
+
+    await ctx.send(
+        embed=embed
+    )
+
+
+# ============================================================
+# ERROR HANDLER
+# ============================================================
+
+@bot.event
+async def on_command_error(
+    ctx: commands.Context,
+    error: Exception,
+):
+
+    if isinstance(
+        error,
+        commands.CommandNotFound,
+    ):
+        return
+
+    if isinstance(
+        error,
+        commands.MissingRequiredArgument,
+    ):
+        await ctx.send(
+            "❌ You're missing something.\n"
+            "Try `!help`."
+        )
+        return
+
+    if isinstance(
+        error,
+        commands.BadArgument,
+    ):
+        await ctx.send(
+            "❌ Invalid command arguments.\n"
+            "Try `!help`."
+        )
+        return
+
+    logger.exception(
+        "Command error",
+        exc_info=error,
+    )
+
+    try:
+        await ctx.send(
+            "❌ Something went wrong while running "
+            "that command.\n"
+            f"```{truncate(str(error), 500)}```"
+        )
+    except Exception:
+        pass
+
+
+# ============================================================
+# READY
+# ============================================================
 
 @bot.event
 async def on_ready():
-    logger.info("========================================")
-    logger.info("🐼 %s connected to Discord!", bot.user)
-    logger.info("discord.py version: %s", discord.__version__)
-    logger.info("========================================")
-    logger.info("Commands:")
-    logger.info("!play [song/URL] - SoundCloud / Spotify")
-    logger.info("!skip")
-    logger.info("!pause")
-    logger.info("!resume")
-    logger.info("!stop")
-    logger.info("!queue")
-    logger.info("!volume [0-100]")
-    logger.info("!leave")
-    logger.info("!help")
-    logger.info("========================================")
 
+    logger.info(
+        "========================================"
+    )
+
+    logger.info(
+        "🐼 %s connected to Discord!",
+        bot.user,
+    )
+
+    logger.info(
+        "discord.py version: %s",
+        discord.__version__,
+    )
+
+    logger.info(
+        "FFmpeg executable: %s",
+        FFMPEG_EXECUTABLE,
+    )
+
+    logger.info(
+        "SoundCloud only: ENABLED"
+    )
+
+    logger.info(
+        "YouTube playback: DISABLED"
+    )
+
+    logger.info(
+        "========================================"
+    )
+
+    logger.info(
+        "Commands:"
+    )
+
+    logger.info(
+        "!play [song/URL] - SoundCloud"
+    )
+
+    logger.info(
+        "!skip"
+    )
+
+    logger.info(
+        "!pause"
+    )
+
+    logger.info(
+        "!resume"
+    )
+
+    logger.info(
+        "!stop"
+    )
+
+    logger.info(
+        "!queue"
+    )
+
+    logger.info(
+        "!volume [0-100]"
+    )
+
+    logger.info(
+        "!leave"
+    )
+
+    logger.info(
+        "!help"
+    )
+
+    logger.info(
+        "========================================"
+    )
+
+
+# ============================================================
+# VOICE STATE DEBUGGING
+# ============================================================
 
 @bot.event
 async def on_voice_state_update(
@@ -735,43 +1561,108 @@ async def on_voice_state_update(
     before: discord.VoiceState,
     after: discord.VoiceState,
 ):
-    # Helpful diagnostics for Render/Discord voice issues.
-    if member.id == bot.user.id:
-        if before.channel and not after.channel:
-            logger.warning(
-                "Bot left voice: guild=%s old_channel=%s",
-                member.guild.id,
-                before.channel.id,
-            )
-        elif after.channel and before.channel != after.channel:
+
+    if member.id != bot.user.id:
+        return
+
+    if before.channel != after.channel:
+
+        if after.channel:
             logger.info(
-                "Bot voice channel: guild=%s channel=%s",
+                "Bot voice channel: "
+                "guild=%s channel=%s",
                 member.guild.id,
                 after.channel.id,
             )
 
+        else:
+            logger.info(
+                "Bot left voice channel: "
+                "guild=%s",
+                member.guild.id,
+            )
+
+
+# ============================================================
+# SHUTDOWN
+# ============================================================
+
+async def shutdown():
+
+    logger.info(
+        "Shutting down Panda Music Bot..."
+    )
+
+    for guild_id, state in list(
+        music.items()
+    ):
+
+        state.queue.clear()
+        state.current = None
+        state.playing = False
+
+        voice = state.voice
+
+        if voice:
+            try:
+                if voice.is_playing():
+                    voice.stop()
+
+                await voice.disconnect(
+                    force=True
+                )
+
+            except Exception:
+                logger.exception(
+                    "Failed to disconnect "
+                    "guild %s",
+                    guild_id,
+                )
+
+
+# ============================================================
+# START BOT
+# ============================================================
 
 async def main():
-    if not DISCORD_TOKEN:
-        logger.error("DISCORD_TOKEN environment variable is not set.")
-        raise RuntimeError("DISCORD_TOKEN environment variable is not set.")
 
-    ffmpeg_path = shutil.which("ffmpeg")
-    if not ffmpeg_path:
-        raise RuntimeError(
-            "FFmpeg is not installed or is not on PATH. "
-            "Make sure Render runs build.sh before starting the bot."
+    try:
+
+        async with bot:
+
+            await bot.start(
+                TOKEN
+            )
+
+    except KeyboardInterrupt:
+
+        logger.info(
+            "Keyboard interrupt received."
         )
-    logger.info("FFmpeg found at: %s", ffmpeg_path)
 
-    # add_cog is awaited in modern discord.py.
-    async with bot:
-        await bot.add_cog(Music(bot))
-        await bot.start(DISCORD_TOKEN, reconnect=True)
+    except Exception:
 
+        logger.exception(
+            "Fatal bot error."
+        )
+
+        raise
+
+    finally:
+
+        try:
+            await shutdown()
+        except Exception:
+            logger.exception(
+                "Error during shutdown."
+            )
+
+
+# ============================================================
+# RUN
+# ============================================================
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Bot stopped.")
+    asyncio.run(
+        main()
+    )
