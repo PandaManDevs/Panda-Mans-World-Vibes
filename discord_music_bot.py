@@ -3,6 +3,7 @@ from discord.ext import commands
 import yt_dlp
 import asyncio
 from typing import Optional
+import os
 
 # Configure bot with intents
 intents = discord.Intents.default()
@@ -194,9 +195,14 @@ async def on_ready():
     print('!leave - Leave voice channel')
 
 async def main():
+    token = os.getenv('DISCORD_TOKEN')
+    if not token:
+        print("ERROR: DISCORD_TOKEN environment variable not set!")
+        return
+    
     async with bot:
         await bot.add_cog(Music(bot))
-        await bot.start('MTUzMzIwOTUxMzA5MDM1MTMyNg.GuEXII.iseknYOGjMQikWJG6y5kiyFMSciGupib83r4sw')
+        await bot.start(token)
 
 if __name__ == '__main__':
     asyncio.run(main())
