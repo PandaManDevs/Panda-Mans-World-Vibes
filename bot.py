@@ -19,9 +19,7 @@ import yt_dlp
 # - Does NOT use Chrome cookies.
 # - Does NOT require the Spotify Web API for Spotify links.
 # - Spotify links are resolved to public metadata and then searched
-#   on SoundCloud only.
-# - Normal text searches use SoundCloud only.
-# - YouTube is intentionally not used.
+#   on SoundCloud/YouTube.
 # - Designed to run as a Render Background Worker.
 # ------------------------------------------------------------
 
@@ -46,17 +44,14 @@ bot = commands.Bot(
 
 # No cookiesfrombrowser / Chrome profile is used here.
 YTDL_OPTIONS = {
-    # IMPORTANT: Do NOT restrict SoundCloud to webm.
-    # SoundCloud commonly returns AAC/Opus/MP3/HLS formats, and
-    # "bestaudio[ext=webm]" causes "No video formats found".
     "format": "bestaudio/best",
     "noplaylist": True,
     "quiet": True,
-    "no_warnings": False,
+    "no_warnings": True,
     "socket_timeout": 30,
-    "retries": 5,
-    "fragment_retries": 5,
-    "extractor_retries": 5,
+    "retries": 3,
+    "fragment_retries": 3,
+    "extractor_retries": 3,
     "http_headers": {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -111,6 +106,14 @@ def is_spotify_url(value: str) -> bool:
 
 def is_soundcloud_url(value: str) -> bool:
     return "soundcloud.com/" in value.lower()
+
+
+def is_youtube_url(value: str) -> bool:
+    return (
+        "youtube.com/" in value.lower()
+        or "youtu.be/" in value.lower()
+        or "music.youtube.com/" in value.lower()
+    )
 
 
 def clean_spotify_title(title: str) -> str:
@@ -183,48 +186,45 @@ async def extract_info(query: str) -> dict:
 
 
 async def search_source(search: str) -> dict:
-    """Resolve a track using SoundCloud only."""
-    search = search.strip()
-
-    if not search:
-        raise ValueError("Please provide a song name or SoundCloud URL.")
-
-    # Direct URLs must be SoundCloud URLs. YouTube is intentionally rejected.
+    """SoundCloud-only search and direct SoundCloud URL extraction."""
     if is_url(search):
         if not is_soundcloud_url(search):
-            raise ValueError(
-                "Only SoundCloud URLs are supported. YouTube is disabled."
-            )
-
-        logger.info("Resolving SoundCloud URL: %s", search)
+            raise ValueError("Only SoundCloud links are supported.")
         data = await extract_info(search)
-
         if data and data.get("entries"):
             entries = [e for e in data["entries"] if e]
-            if entries:
-                data = entries[0]
-
+            data = entries[0] if entries else None
         if not data:
-            raise ValueError("SoundCloud did not return a playable result.")
-
+            raise ValueError("No playable SoundCloud result was found.")
         return data
 
-    # Text search: SoundCloud only.
-    sc_query = f"scsearch1:{search}"
     logger.info("Searching SoundCloud: %s", search)
+    search_options = dict(YTDL_OPTIONS)
+    search_options["extract_flat"] = True
+    loop = asyncio.get_running_loop()
 
-    try:
-        data = await extract_info(sc_query)
-    except Exception as exc:
-        logger.exception("SoundCloud search failed")
-        raise ValueError(f"SoundCloud search failed: {exc}") from exc
+    def do_search():
+        with yt_dlp.YoutubeDL(search_options) as search_ytdl:
+            return search_ytdl.extract_info(f"scsearch5:{search}", download=False)
 
+    data = await loop.run_in_executor(None, do_search)
+    entries = [e for e in (data or {}).get("entries", []) if e]
+    if not entries:
+        raise ValueError(f"No SoundCloud results found for `{search}`.")
+
+    selected = entries[0]
+    track_url = selected.get("webpage_url") or selected.get("original_url") or selected.get("url")
+    if not track_url or not is_soundcloud_url(track_url):
+        raise ValueError("SoundCloud search returned an invalid track URL.")
+
+    logger.info("Selected SoundCloud track: %s", track_url)
+    data = await extract_info(track_url)
     if data and data.get("entries"):
         entries = [e for e in data["entries"] if e]
-        if entries:
-            return entries[0]
-
-    raise ValueError(f"No SoundCloud result found for: {search}")
+        data = entries[0] if entries else None
+    if not data:
+        raise ValueError("Could not extract the selected SoundCloud track.")
+    return data
 
 
 class Track:
@@ -336,73 +336,32 @@ class Music(commands.Cog):
         return voice
 
     async def make_source(self, track: Track) -> discord.AudioSource:
-        # SoundCloud stream URLs are signed/temporary. Always re-extract the
-        # page immediately before playback instead of reusing an old stream URL
-        # that may have expired while the track was waiting in the queue.
-        if not track.webpage_url or not is_soundcloud_url(track.webpage_url):
-            raise ValueError("This track is not a valid SoundCloud track.")
+        if not is_soundcloud_url(track.webpage_url):
+            raise ValueError("This bot only plays SoundCloud audio.")
 
         logger.info("Refreshing SoundCloud stream: %s", track.webpage_url)
         data = await extract_info(track.webpage_url)
-
         if data and data.get("entries"):
-            data = next((e for e in data["entries"] if e), data)
-
+            entries = [e for e in data["entries"] if e]
+            data = entries[0] if entries else None
         if not data:
-            raise ValueError("SoundCloud returned no track information.")
+            raise ValueError("SoundCloud returned no track data.")
 
         direct_url = data.get("url")
         if not direct_url:
-            raise ValueError(
-                "SoundCloud returned no playable audio format for this track."
-            )
+            raise ValueError("SoundCloud did not provide a playable audio URL.")
 
-        # Keep the refreshed metadata for later retries.
         track.data = data
-        track.title = data.get("title") or track.title
-        track.duration = data.get("duration") or track.duration
-        track.uploader = data.get("uploader") or data.get("channel") or track.uploader
+        track.title = data.get("title") or track.title or "Unknown title"
+        track.webpage_url = data.get("webpage_url") or track.webpage_url
+        track.duration = data.get("duration") or track.duration or 0
+        track.uploader = data.get("uploader") or data.get("channel") or track.uploader or "Unknown"
+        track.source_name = "SoundCloud"
 
-        # yt-dlp gives us the headers required for signed SoundCloud streams.
-        # Passing them to FFmpeg prevents many HTTP 401/403/EOF failures.
-        headers = data.get("http_headers") or {}
-        user_agent = headers.get("User-Agent") or YTDL_OPTIONS["http_headers"]["User-Agent"]
-        accept_language = headers.get("Accept-Language") or YTDL_OPTIONS["http_headers"]["Accept-Language"]
-        referer = headers.get("Referer")
+        logger.info("Starting FFmpeg playback: guild=%s source=SoundCloud url=%s", track.requested_by.guild.id, direct_url[:180])
+        source = discord.FFmpegPCMAudio(direct_url, executable=FFMPEG_EXECUTABLE, before_options=FFMPEG_BEFORE_OPTIONS, options=FFMPEG_OPTIONS)
+        return discord.PCMVolumeTransformer(source, volume=self.volumes.get(track.requested_by.guild.id, 0.5))
 
-        header_lines = [
-            f"User-Agent: {user_agent}",
-            f"Accept-Language: {accept_language}",
-        ]
-        if referer:
-            header_lines.append(f"Referer: {referer}")
-
-        ffmpeg_headers = "\r\n".join(header_lines) + "\r\n"
-        before_options = (
-            FFMPEG_BEFORE_OPTIONS
-            + " -headers "
-            + '"' + ffmpeg_headers.replace('"', '\\"') + '"'
-        )
-
-        logger.info(
-            "Starting FFmpeg playback: guild=%s source=SoundCloud format=%s protocol=%s url=%s",
-            track.requested_by.guild.id,
-            data.get("format_id", "unknown"),
-            data.get("protocol", "unknown"),
-            direct_url[:180],
-        )
-
-        source = discord.FFmpegPCMAudio(
-            direct_url,
-            executable=FFMPEG_EXECUTABLE,
-            before_options=before_options,
-            options=FFMPEG_OPTIONS,
-        )
-
-        return discord.PCMVolumeTransformer(
-            source,
-            volume=self.volumes.get(track.requested_by.guild.id, 0.5),
-        )
 
     async def play_next(self, guild: discord.Guild, channel: discord.abc.Messageable):
         guild_id = guild.id
@@ -492,7 +451,7 @@ class Music(commands.Cog):
 
             self.now_playing[guild_id] = None
 
-    @commands.command(name="play", help="Play a SoundCloud song, URL, or Spotify link")
+    @commands.command(name="play", help="Play a song, URL, or Spotify link")
     async def play(self, ctx: commands.Context, *, search: str):
         voice = await self.ensure_voice(ctx)
         if voice is None:
@@ -502,7 +461,7 @@ class Music(commands.Cog):
             try:
                 original = search.strip()
 
-                # Spotify: public oEmbed metadata -> search on SoundCloud only.
+                # Spotify: public oEmbed metadata -> search on SoundCloud/YouTube.
                 if is_spotify_url(original):
                     logger.info("Resolving Spotify link: %s", original)
                     try:
@@ -526,6 +485,9 @@ class Music(commands.Cog):
                     data = await search_source(search_text)
 
                 else:
+                    if is_youtube_url(original):
+                        await ctx.send("❌ YouTube is not supported. Please use SoundCloud.")
+                        return
                     data = await search_source(original)
 
                 if data.get("entries"):
@@ -726,7 +688,7 @@ async def on_ready():
     logger.info("discord.py version: %s", discord.__version__)
     logger.info("========================================")
     logger.info("Commands:")
-    logger.info("!play [song/URL] - YouTube/SoundCloud/Spotify")
+    logger.info("!play [song/URL] - SoundCloud / Spotify")
     logger.info("!skip")
     logger.info("!pause")
     logger.info("!resume")
