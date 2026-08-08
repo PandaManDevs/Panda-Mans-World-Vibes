@@ -5,8 +5,6 @@ import asyncio
 from typing import Optional
 import os
 import logging
-import spotipy
-from spotipy.oauth2 import SpotifyClientCredentials
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -19,29 +17,13 @@ intents.voice_states = True
 
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-# Initialize Spotify client (optional - will work without it)
-spotify_client = None
-try:
-    SPOTIFY_CLIENT_ID = os.getenv('SPOTIFY_CLIENT_ID')
-    SPOTIFY_CLIENT_SECRET = os.getenv('SPOTIFY_CLIENT_SECRET')
-    if SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET:
-        spotify_client = spotipy.Spotify(
-            auth_manager=SpotifyClientCredentials(
-                client_id=SPOTIFY_CLIENT_ID,
-                client_secret=SPOTIFY_CLIENT_SECRET
-            )
-        )
-        logger.info("✅ Spotify client initialized successfully")
-    else:
-        logger.warning("⚠️  Spotify credentials not found. Spotify support disabled.")
-except Exception as e:
-    logger.warning(f"⚠️  Could not initialize Spotify: {str(e)}")
+# Get SoundCloud client ID from environment
+SOUNDCLOUD_CLIENT_ID = os.getenv('SOUNDCLOUD_CLIENT_ID')
 
-# YouTube DL configuration with cookies and better headers
+# YouTube DL configuration for SoundCloud
 ytdl_format_options = {
     'format': 'bestaudio/best',
     'noplaylist': True,
-    'default_search': 'ytsearch',
     'quiet': False,
     'no_warnings': False,
     'socket_timeout': 30,
@@ -49,17 +31,27 @@ ytdl_format_options = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Accept-Language': 'en-US,en;q=0.9',
     },
-    'extractor_args': {
-        'youtube': {
-            'player_client': ['web'],
-            'player_skip': ['js', 'configs'],
-        },
-        'soundcloud': {
-            'api_hostname': 'api-v2.soundcloud.com',
-        }
-    },
-    'cookiesfrombrowser': ['chrome'],  # Try to extract cookies from Chrome
 }
+
+# Add SoundCloud client ID if available
+if SOUNDCLOUD_CLIENT_ID:
+    ytdl_format_options['extractor_args'] = {
+        'soundcloud': {
+            'client_id': SOUNDCLOUD_CLIENT_ID,
+        }
+    }
+    logger.info("✅ SoundCloud client ID loaded from environment")
+else:
+    logger.warning("⚠️  SOUNDCLOUD_CLIENT_ID not found! SoundCloud tracks may not play.")
+    logger.warning("📝 Follow the instructions below to get a client ID:")
+    logger.warning("   1. Go to https://soundcloud.com in your browser")
+    logger.warning("   2. Open Developer Tools (F12 or Right-click → Inspect)")
+    logger.warning("   3. Go to Network tab")
+    logger.warning("   4. Play any song")
+    logger.warning("   5. Look for requests to api-v2.soundcloud.com")
+    logger.warning("   6. Click one and check headers/query params for 'client_id'")
+    logger.warning("   7. Copy the client_id value")
+    logger.warning("   8. Add it as SOUNDCLOUD_CLIENT_ID environment variable in Render")
 
 ytdl = yt_dlp.YoutubeDL(ytdl_format_options)
 
@@ -98,20 +90,6 @@ class YTDLSource(discord.PCMVolumeTransformer):
             logger.error(f"Error extracting from URL {url}: {str(e)}")
             raise
 
-def extract_spotify_info(spotify_url):
-    """Extract track name and artist from Spotify URL"""
-    try:
-        if 'spotify.com/track/' in spotify_url:
-            track_id = spotify_url.split('/')[-1].split('?')[0]
-            track = spotify_client.track(track_id)
-            artist = track['artists'][0]['name']
-            title = track['name']
-            return f"{title} {artist}", title
-        return None, None
-    except Exception as e:
-        logger.error(f"Error extracting Spotify info: {str(e)}")
-        return None, None
-
 class Music(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
@@ -145,7 +123,7 @@ class Music(commands.Cog):
                     seconds = duration % 60
                     embed.add_field(name="Duration", value=f"{minutes}:{seconds:02d}", inline=False)
                 
-                embed.add_field(name="Source", value=self.now_playing.get('source', 'Unknown'), inline=False)
+                embed.add_field(name="Source", value="SoundCloud", inline=False)
                 await ctx.send(embed=embed)
             except Exception as e:
                 logger.error(f"Error playing track: {str(e)}")
@@ -156,9 +134,9 @@ class Music(commands.Cog):
             self.now_playing = None
             self.is_playing = False
 
-    @commands.command(name='play', help='Play a song from YouTube, Spotify, or SoundCloud')
+    @commands.command(name='play', help='Play a song from SoundCloud')
     async def play(self, ctx, *, search: str):
-        """Play a song by search query or URL (YouTube, Spotify, SoundCloud)"""
+        """Play a song from SoundCloud by URL or search query"""
         if ctx.voice_client is None:
             if ctx.author.voice:
                 try:
@@ -172,24 +150,11 @@ class Music(commands.Cog):
 
         async with ctx.typing():
             try:
-                logger.info(f"Searching for: {search}")
+                logger.info(f"Searching SoundCloud for: {search}")
                 
-                # Check if it's a Spotify link
-                if 'spotify.com' in search and spotify_client:
-                    search_query, title = extract_spotify_info(search)
-                    if search_query:
-                        logger.info(f"Converting Spotify to YouTube search: {search_query}")
-                        search = search_query
-                        source = "Spotify"
-                    else:
-                        await ctx.send("❌ Could not extract Spotify track info. Make sure you have Spotify credentials set.")
-                        return
-                elif 'soundcloud.com' in search:
-                    source = "SoundCloud"
-                elif 'youtube.com' in search or 'youtu.be' in search:
-                    source = "YouTube"
-                else:
-                    source = "YouTube Search"
+                # If it's not a SoundCloud URL, search for it
+                if 'soundcloud.com' not in search:
+                    search = f"scsearch:{search}"
                 
                 # Extract info
                 data = await asyncio.get_event_loop().run_in_executor(
@@ -207,8 +172,7 @@ class Music(commands.Cog):
                 song_info = {
                     'url': search,
                     'title': data.get('title', 'Unknown Title'),
-                    'duration': data.get('duration', 0),
-                    'source': source
+                    'duration': data.get('duration', 0)
                 }
 
                 if ctx.voice_client.is_playing() or self.is_playing:
@@ -219,7 +183,6 @@ class Music(commands.Cog):
                         color=discord.Color.blue()
                     )
                     embed.add_field(name="Position", value=f"#{len(self.queue)}", inline=False)
-                    embed.add_field(name="Source", value=source, inline=False)
                     await ctx.send(embed=embed)
                 else:
                     await self.play_next(ctx)
@@ -271,13 +234,13 @@ class Music(commands.Cog):
             await ctx.send("❌ Queue is empty!")
             return
 
-        embed = discord.Embed(title="🎵 Music Queue", color=discord.Color.purple())
+        embed = discord.Embed(title="🎵 SoundCloud Queue", color=discord.Color.purple())
         if self.now_playing:
             embed.add_field(name="Now Playing", value=self.now_playing['title'], inline=False)
         
         if self.queue:
             for i, song in enumerate(self.queue[:10], 1):
-                embed.add_field(name=f"{i}. {song['title']}", value=f"Source: {song.get('source', 'Unknown')}", inline=False)
+                embed.add_field(name=f"{i}. {song['title']}", value="⠀", inline=False)
             
             if len(self.queue) > 10:
                 embed.add_field(name="And more...", value=f"{len(self.queue) - 10} more songs", inline=False)
@@ -312,8 +275,10 @@ class Music(commands.Cog):
 async def on_ready():
     print(f'{bot.user} has connected to Discord!')
     print('------')
+    print('🎵 SoundCloud Music Bot')
+    print('------')
     print('Commands:')
-    print('!play [song/URL] - Play a song (YouTube, Spotify, SoundCloud)')
+    print('!play [song/URL] - Play a song from SoundCloud')
     print('!skip - Skip current song')
     print('!pause - Pause playback')
     print('!resume - Resume playback')
@@ -322,6 +287,28 @@ async def on_ready():
     print('!volume [0-100] - Set volume')
     print('!leave - Leave voice channel')
     print('------')
+    
+    if not SOUNDCLOUD_CLIENT_ID:
+        print('⚠️  SOUNDCLOUD_CLIENT_ID not set!')
+        print('📝 Follow these steps to get it:')
+        print('')
+        print('STEP 1: Open https://soundcloud.com in your browser')
+        print('STEP 2: Open Developer Tools (Press F12 or Right-click → Inspect)')
+        print('STEP 3: Click the "Network" tab at the top')
+        print('STEP 4: Play any song on SoundCloud')
+        print('STEP 5: Look for requests to "api-v2.soundcloud.com"')
+        print('STEP 6: Click on one of these requests')
+        print('STEP 7: In the "Headers" or "Query String Parameters" section, find "client_id"')
+        print('STEP 8: Copy the long string value (looks like: abc123def456...)')
+        print('')
+        print('STEP 9: Go to your Render Dashboard')
+        print('STEP 10: Click on your service → Environment')
+        print('STEP 11: Add a new variable:')
+        print('        Key: SOUNDCLOUD_CLIENT_ID')
+        print('        Value: (paste the client_id you copied)')
+        print('STEP 12: Click Save and Redeploy')
+        print('')
+        print('Once set, restart the bot and SoundCloud songs will play!')
 
 async def main():
     token = os.getenv('DISCORD_TOKEN')
