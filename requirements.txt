@@ -1,5 +1,4 @@
 discord.py==2.7.1
 PyNaCl
-yt-dlp[default]==2026.7.4
+yt-dlp==2026.7.4
 davey==0.1.6
-bgutil-ytdlp-pot-provider
