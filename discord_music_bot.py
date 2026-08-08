@@ -5,6 +5,8 @@ import asyncio
 from typing import Optional
 import os
 import logging
+import spotipy
+from spotipy.oauth2 import SpotifyClientCredentials
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -17,7 +19,25 @@ intents.voice_states = True
 
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-# YouTube DL configuration with better headers and anti-bot detection
+# Initialize Spotify client (optional - will work without it)
+spotify_client = None
+try:
+    SPOTIFY_CLIENT_ID = os.getenv('SPOTIFY_CLIENT_ID')
+    SPOTIFY_CLIENT_SECRET = os.getenv('SPOTIFY_CLIENT_SECRET')
+    if SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET:
+        spotify_client = spotipy.Spotify(
+            auth_manager=SpotifyClientCredentials(
+                client_id=SPOTIFY_CLIENT_ID,
+                client_secret=SPOTIFY_CLIENT_SECRET
+            )
+        )
+        logger.info("✅ Spotify client initialized successfully")
+    else:
+        logger.warning("⚠️  Spotify credentials not found. Spotify support disabled.")
+except Exception as e:
+    logger.warning(f"⚠️  Could not initialize Spotify: {str(e)}")
+
+# YouTube DL configuration with cookies and better headers
 ytdl_format_options = {
     'format': 'bestaudio/best',
     'noplaylist': True,
@@ -33,8 +53,12 @@ ytdl_format_options = {
         'youtube': {
             'player_client': ['web'],
             'player_skip': ['js', 'configs'],
+        },
+        'soundcloud': {
+            'api_hostname': 'api-v2.soundcloud.com',
         }
     },
+    'cookiesfrombrowser': ['chrome'],  # Try to extract cookies from Chrome
 }
 
 ytdl = yt_dlp.YoutubeDL(ytdl_format_options)
@@ -74,6 +98,20 @@ class YTDLSource(discord.PCMVolumeTransformer):
             logger.error(f"Error extracting from URL {url}: {str(e)}")
             raise
 
+def extract_spotify_info(spotify_url):
+    """Extract track name and artist from Spotify URL"""
+    try:
+        if 'spotify.com/track/' in spotify_url:
+            track_id = spotify_url.split('/')[-1].split('?')[0]
+            track = spotify_client.track(track_id)
+            artist = track['artists'][0]['name']
+            title = track['name']
+            return f"{title} {artist}", title
+        return None, None
+    except Exception as e:
+        logger.error(f"Error extracting Spotify info: {str(e)}")
+        return None, None
+
 class Music(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
@@ -107,6 +145,7 @@ class Music(commands.Cog):
                     seconds = duration % 60
                     embed.add_field(name="Duration", value=f"{minutes}:{seconds:02d}", inline=False)
                 
+                embed.add_field(name="Source", value=self.now_playing.get('source', 'Unknown'), inline=False)
                 await ctx.send(embed=embed)
             except Exception as e:
                 logger.error(f"Error playing track: {str(e)}")
@@ -117,9 +156,9 @@ class Music(commands.Cog):
             self.now_playing = None
             self.is_playing = False
 
-    @commands.command(name='play', help='Play a song from YouTube')
+    @commands.command(name='play', help='Play a song from YouTube, Spotify, or SoundCloud')
     async def play(self, ctx, *, search: str):
-        """Play a song by search query or URL"""
+        """Play a song by search query or URL (YouTube, Spotify, SoundCloud)"""
         if ctx.voice_client is None:
             if ctx.author.voice:
                 try:
@@ -135,7 +174,24 @@ class Music(commands.Cog):
             try:
                 logger.info(f"Searching for: {search}")
                 
-                # Extract info with better error handling
+                # Check if it's a Spotify link
+                if 'spotify.com' in search and spotify_client:
+                    search_query, title = extract_spotify_info(search)
+                    if search_query:
+                        logger.info(f"Converting Spotify to YouTube search: {search_query}")
+                        search = search_query
+                        source = "Spotify"
+                    else:
+                        await ctx.send("❌ Could not extract Spotify track info. Make sure you have Spotify credentials set.")
+                        return
+                elif 'soundcloud.com' in search:
+                    source = "SoundCloud"
+                elif 'youtube.com' in search or 'youtu.be' in search:
+                    source = "YouTube"
+                else:
+                    source = "YouTube Search"
+                
+                # Extract info
                 data = await asyncio.get_event_loop().run_in_executor(
                     None,
                     lambda: ytdl.extract_info(search, download=False)
@@ -149,9 +205,10 @@ class Music(commands.Cog):
                     data = data['entries'][0]
                 
                 song_info = {
-                    'url': search,  # Use the original search/URL
+                    'url': search,
                     'title': data.get('title', 'Unknown Title'),
-                    'duration': data.get('duration', 0)
+                    'duration': data.get('duration', 0),
+                    'source': source
                 }
 
                 if ctx.voice_client.is_playing() or self.is_playing:
@@ -162,6 +219,7 @@ class Music(commands.Cog):
                         color=discord.Color.blue()
                     )
                     embed.add_field(name="Position", value=f"#{len(self.queue)}", inline=False)
+                    embed.add_field(name="Source", value=source, inline=False)
                     await ctx.send(embed=embed)
                 else:
                     await self.play_next(ctx)
@@ -219,7 +277,7 @@ class Music(commands.Cog):
         
         if self.queue:
             for i, song in enumerate(self.queue[:10], 1):
-                embed.add_field(name=f"{i}. {song['title']}", value="⠀", inline=False)
+                embed.add_field(name=f"{i}. {song['title']}", value=f"Source: {song.get('source', 'Unknown')}", inline=False)
             
             if len(self.queue) > 10:
                 embed.add_field(name="And more...", value=f"{len(self.queue) - 10} more songs", inline=False)
@@ -255,7 +313,7 @@ async def on_ready():
     print(f'{bot.user} has connected to Discord!')
     print('------')
     print('Commands:')
-    print('!play [song/URL] - Play a song')
+    print('!play [song/URL] - Play a song (YouTube, Spotify, SoundCloud)')
     print('!skip - Skip current song')
     print('!pause - Pause playback')
     print('!resume - Resume playback')
