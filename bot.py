@@ -93,7 +93,7 @@ FFMPEG_BEFORE_OPTIONS = (
     "-reconnect_delay_max 5 "
     "-protocol_whitelist file,http,https,tcp,tls,crypto"
 )
-FFMPEG_OPTIONS = "-vn -sn -dn -loglevel warning"
+FFMPEG_OPTIONS = "-vn -sn -dn -f s16le -ar 48000 -ac 2 -loglevel warning"
 
 
 def is_url(value: str) -> bool:
@@ -411,6 +411,12 @@ class Music(commands.Cog):
                         future.add_done_callback(done_callback)
 
                     voice.play(source, after=after_playback)
+
+                    logger.info(
+                        "🎵 voice.play() called | playing=%s paused=%s",
+                        voice.is_playing(),
+                        voice.is_paused(),
+                    )
 
                     embed = discord.Embed(
                         title="🎵 Now Playing",
