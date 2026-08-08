@@ -1,3 +1,4 @@
 discord.py==2.3.2
 yt-dlp
 pynacl==1.5.0
+spotipy>=2.22.1
