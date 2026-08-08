@@ -87,11 +87,15 @@ FFMPEG_EXECUTABLE = shutil.which("ffmpeg") or "ffmpeg"
 FFMPEG_BEFORE_OPTIONS = (
     "-reconnect 1 "
     "-reconnect_streamed 1 "
-    "-reconnect_at_eof 1 "
     "-reconnect_on_network_error 1 "
     "-reconnect_on_http_error 4xx,5xx "
     "-reconnect_delay_max 5 "
-    "-protocol_whitelist file,http,https,tcp,tls,crypto"
+    "-rw_timeout 15000000 "
+    "-protocol_whitelist file,http,https,tcp,tls,crypto "
+    "-user_agent "
+    "\"Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/139.0.0.0 Safari/537.36\""
 )
 FFMPEG_OPTIONS = "-vn -sn -dn -f s16le -ar 48000 -ac 2 -loglevel warning"
 
@@ -187,12 +191,68 @@ async def extract_info(query: str) -> dict:
 
 async def search_source(search: str) -> dict:
     """
-    Search SoundCloud first for normal text.
-    If it doesn't return a result, fall back to YouTube.
-    This avoids sending every text query through YouTube.
+    Resolve a playable track.
+
+    Important for Render:
+    - Prefer YouTube for normal text searches because SoundCloud can return
+      signed HLS (.m3u8) URLs that may close with an FFmpeg "End of file"
+      error from some cloud-hosted environments.
+    - Direct YouTube URLs are played directly.
+    - Direct SoundCloud URLs are resolved to metadata, then searched on
+      YouTube so the bot does not depend on SoundCloud HLS playback.
+    - SoundCloud remains a fallback for normal searches if YouTube fails.
     """
-    # A URL is extracted directly.
+    # Direct URL.
     if is_url(search):
+        if is_soundcloud_url(search):
+            try:
+                logger.info(
+                    "SoundCloud URL detected; resolving metadata then using "
+                    "YouTube for playback: %s",
+                    search,
+                )
+                data = await extract_info(search)
+                if data and data.get("entries"):
+                    data = next(
+                        (entry for entry in data["entries"] if entry),
+                        None,
+                    )
+
+                if data:
+                    title = data.get("title") or ""
+                    uploader = (
+                        data.get("uploader")
+                        or data.get("channel")
+                        or ""
+                    )
+                    yt_query = f"{title} {uploader}".strip()
+
+                    if yt_query:
+                        yt_data = await extract_info(
+                            f"ytsearch1:{yt_query}"
+                        )
+                        if yt_data and yt_data.get("entries"):
+                            entries = [
+                                entry
+                                for entry in yt_data["entries"]
+                                if entry
+                            ]
+                            if entries:
+                                logger.info(
+                                    "Using YouTube playback for SoundCloud "
+                                    "track: %s",
+                                    entries[0].get("title", yt_query),
+                                )
+                                return entries[0]
+
+                    return data
+            except Exception as exc:
+                logger.warning(
+                    "SoundCloud URL resolution failed: %s",
+                    exc,
+                )
+                raise
+
         data = await extract_info(search)
         if data and data.get("entries"):
             entries = [e for e in data["entries"] if e]
@@ -201,10 +261,27 @@ async def search_source(search: str) -> dict:
             data = entries[0]
         return data
 
-    # SoundCloud search.
+    # Prefer YouTube for text searches. This avoids the SoundCloud HLS
+    # playback URL that was producing:
+    # [https] ... error=End of file
+    logger.info("Searching YouTube first: %s", search)
+    try:
+        data = await extract_info(f"ytsearch1:{search}")
+        if data and data.get("entries"):
+            entries = [e for e in data["entries"] if e]
+            if entries:
+                logger.info(
+                    "YouTube result selected: %s",
+                    entries[0].get("title", "Unknown"),
+                )
+                return entries[0]
+    except Exception as exc:
+        logger.warning("YouTube search failed: %s", exc)
+
+    # SoundCloud fallback.
     try:
         sc_query = f"scsearch1:{search}"
-        logger.info("Searching SoundCloud: %s", search)
+        logger.info("YouTube failed; trying SoundCloud: %s", search)
         data = await extract_info(sc_query)
         if data and data.get("entries"):
             entries = [e for e in data["entries"] if e]
@@ -212,14 +289,6 @@ async def search_source(search: str) -> dict:
                 return entries[0]
     except Exception as exc:
         logger.warning("SoundCloud search failed: %s", exc)
-
-    # YouTube fallback.
-    logger.info("SoundCloud returned no result; searching YouTube: %s", search)
-    data = await extract_info(f"ytsearch1:{search}")
-    if data and data.get("entries"):
-        entries = [e for e in data["entries"] if e]
-        if entries:
-            return entries[0]
 
     raise ValueError("Could not find a playable result.")
 
