@@ -1,58 +1,60 @@
-# Panda Man's World Vibes - Fixed Discord Music Bot
+# Panda Man's World Vibes
 
-## Render setup
+SoundCloud-only Discord music bot for Render.
 
-Create a **Background Worker** on Render (not a Web Service).
+## Commands
 
-Build command:
+- `!play <song>` — searches SoundCloud
+- `!play <SoundCloud URL>` — plays a direct SoundCloud track
+- `!skip`
+- `!pause`
+- `!resume`
+- `!stop`
+- `!queue`
+- `!volume <0-100>`
+- `!leave`
+- `!help`
+
+## Render
+
+Use a **Background Worker**.
+
+### Build Command
+
 ```text
 bash build.sh
 ```
 
-Start command:
+### Start Command
+
 ```text
-python discord_music_bot.py
+python bot.py
 ```
 
-Required environment variable:
+### Environment Variables
+
+Required:
+
 ```text
-DISCORD_TOKEN=your_discord_bot_token
+DISCORD_TOKEN=your_bot_token
 ```
 
-Optional:
+Optional but recommended for SoundCloud extraction:
+
 ```text
 SOUNDCLOUD_CLIENT_ID=your_soundcloud_client_id
 ```
 
-## What was fixed
+YouTube is intentionally not used by this bot. YouTube cookies, PO tokens, and BgUtils are not required.
 
-- Upgraded discord.py from 2.3.2 to 2.7.1.
-- Added Discord voice reconnect handling.
-- Removed Chrome cookie extraction completely.
-- Added FFmpeg installation during Render build.
-- Removed the Spotify Web API dependency that caused the 403 Premium error.
-- Spotify links now use Spotify's public oEmbed metadata and search for the track on SoundCloud/YouTube.
-- Added SoundCloud-first text search with YouTube fallback.
-- Added per-server queues.
-- Fixed queue progression and callback handling.
-- Added safer voice reconnect/move behavior.
-- Added `!help`.
-- Configured Render as a Background Worker so it does not require an HTTP port.
+## Audio
 
-## Commands
+The bot:
 
-`!play <song / URL>`
-`!skip`
-`!pause`
-`!resume`
-`!stop`
-`!queue`
-`!volume <0-100>`
-`!leave`
-`!help`
+1. Searches SoundCloud only.
+2. Refreshes the SoundCloud stream immediately before playback so signed URLs are fresh.
+3. Prefers SoundCloud HTTP audio formats before HLS.
+4. Passes SoundCloud's extractor HTTP headers to FFmpeg when available.
+5. Uses FFmpeg reconnect options for transient stream/network failures.
 
-## Audio playback fix
-
-This version explicitly locates FFmpeg and uses it to decode remote HTTP/HLS audio streams. It also enables reconnect/protocol options needed by SoundCloud HLS streams. Render must run `bash build.sh` before `python discord_music_bot.py`.
-
-Use a **Background Worker** on Render. Do not use a Web Service unless you add an HTTP health server.
+Make sure FFmpeg is available in the Render runtime. The included `build.sh` checks for it.

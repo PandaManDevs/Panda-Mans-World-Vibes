@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import shutil
+import subprocess
 from typing import Optional
 
 import discord
@@ -158,30 +159,67 @@ ytdl = yt_dlp.YoutubeDL(
 # FFMPEG SETTINGS
 # ============================================================
 
-FFMPEG_BEFORE_OPTIONS = (
-    "-reconnect 1 "
-    "-reconnect_streamed 1 "
-    "-reconnect_on_network_error 1 "
-    "-reconnect_on_http_error 4xx,5xx "
-    "-reconnect_delay_max 5 "
-    "-rw_timeout 15000000 "
-    "-protocol_whitelist file,http,https,tcp,tls,crypto "
-    "-user_agent "
-    "\"Mozilla/5.0 "
-    "(Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 "
-    "(KHTML, like Gecko) "
-    "Chrome/139.0.0.0 "
-    "Safari/537.36\""
-)
-
-
 FFMPEG_OPTIONS = (
     "-vn "
     "-sn "
     "-dn "
     "-loglevel warning"
 )
+
+
+def build_ffmpeg_before_options(http_headers=None):
+    """
+    Build FFmpeg input options for SoundCloud's signed stream URL.
+
+    SoundCloud can return short-lived signed URLs. Reusing the extractor's
+    headers helps FFmpeg access the stream instead of immediately receiving
+    an HTTP error/EOF.
+    """
+    options = [
+        "-reconnect", "1",
+        "-reconnect_streamed", "1",
+        "-reconnect_on_network_error", "1",
+        "-reconnect_on_http_error", "4xx,5xx",
+        "-reconnect_delay_max", "5",
+        "-rw_timeout", "15000000",
+        "-protocol_whitelist", "file,http,https,tcp,tls,crypto",
+    ]
+
+    headers = dict(http_headers or {})
+
+    # FFmpeg's -headers expects CRLF-separated HTTP headers.
+    # Don't duplicate User-Agent here because we set it explicitly below.
+    header_lines = []
+    for key, value in headers.items():
+        if key.lower() == "user-agent":
+            continue
+        if value is None:
+            continue
+        header_lines.append(f"{key}: {value}")
+
+    if header_lines:
+        options.extend([
+            "-headers",
+            "\r\n".join(header_lines) + "\r\n"
+        ])
+
+    options.extend([
+        "-user_agent",
+        (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/139.0.0.0 Safari/537.36"
+        ),
+    ])
+
+    return " ".join(
+        f'"{x}"' if " " in x or "\r" in x or "\n" in x else x
+        for x in options
+    )
+
+
+
+FFMPEG_BEFORE_OPTIONS = build_ffmpeg_before_options()
 
 
 # ============================================================
@@ -214,6 +252,11 @@ class Track:
         self.stream_url = (
             data.get("url")
             or ""
+        )
+
+        self.http_headers = (
+            data.get("http_headers")
+            or {}
         )
 
         self.duration = (
@@ -539,58 +582,46 @@ class Music(commands.Cog):
         track: Track
     ):
 
-        stream_url = track.stream_url
-
-        # ----------------------------------------------------
-        # IF STREAM URL IS MISSING, RE-EXTRACT
-        # ----------------------------------------------------
-
-        if not stream_url:
-
-            logger.info(
-                "Stream URL missing. Re-extracting SoundCloud track."
-            )
-
-            data = await self.get_soundcloud_url(
-                track.url
-            )
-
-            stream_url = (
-                data.get("url")
-                or ""
-            )
-
-            track.data = data
-
-            track.stream_url = stream_url
-
-        if not stream_url:
-
-            raise RuntimeError(
-                "SoundCloud did not provide a playable stream."
-            )
-
+        # SoundCloud stream URLs are signed and can expire.
+        # Always refresh the track immediately before playback.
         logger.info(
-            "SoundCloud stream selected."
+            "Refreshing SoundCloud stream for: %s",
+            track.title
+        )
+
+        data = await self.get_soundcloud_url(
+            track.url
+        )
+
+        stream_url = (
+            data.get("url")
+            or ""
+        )
+
+        if not stream_url:
+            raise RuntimeError(
+                "SoundCloud did not provide a playable audio stream."
+            )
+
+        track.data = data
+        track.stream_url = stream_url
+        track.http_headers = (
+            data.get("http_headers")
+            or {}
         )
 
         logger.info(
-            "Stream URL: %s",
-            stream_url[:250]
+            "SoundCloud stream selected for '%s'.",
+            track.title
         )
 
         source = discord.FFmpegPCMAudio(
             stream_url,
-
             executable=FFMPEG,
-
-            before_options=(
-                FFMPEG_BEFORE_OPTIONS
+            before_options=build_ffmpeg_before_options(
+                track.http_headers
             ),
-
-            options=(
-                FFMPEG_OPTIONS
-            )
+            options=FFMPEG_OPTIONS
         )
 
         volume = self.volumes.get(
@@ -729,11 +760,15 @@ class Music(commands.Cog):
                 f"`{str(e)[:900]}`"
             )
 
-            # Try next track automatically.
-            await self.play_next(
-                guild,
-                channel
-            )
+            # Try the next queued track automatically.
+            # Schedule it on the event loop rather than recursively nesting
+            # coroutines in the same call stack.
+            if self.get_queue(guild.id):
+                await asyncio.sleep(1)
+                await self.play_next(
+                    guild,
+                    channel
+                )
 
     # ========================================================
     # !PLAY
@@ -1141,6 +1176,58 @@ class Music(commands.Cog):
 
 
 # ============================================================
+# COMMAND ERROR HANDLER
+# ============================================================
+
+@bot.event
+async def on_command_error(ctx, error):
+
+    if isinstance(error, commands.CommandNotFound):
+        return
+
+    if isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send(
+            "❌ Missing something. Try `!help`."
+        )
+        return
+
+    if isinstance(error, commands.BadArgument):
+        await ctx.send(
+            "❌ Invalid command argument. Try `!help`."
+        )
+        return
+
+    logger.exception(
+        "Command error in %s: %s",
+        getattr(ctx.command, "qualified_name", "unknown"),
+        error
+    )
+
+    try:
+        await ctx.send(
+            "❌ Something went wrong while running that command."
+        )
+    except Exception:
+        pass
+
+
+# ============================================================
+# VOICE DISCONNECT CLEANUP
+# ============================================================
+
+@bot.event
+async def on_voice_state_update(member, before, after):
+
+    if bot.user and member.id == bot.user.id:
+        if before.channel and after.channel is None:
+            guild_id = before.channel.guild.id
+            logger.warning(
+                "Bot was disconnected from voice: guild=%s",
+                guild_id
+            )
+
+
+# ============================================================
 # BOT READY
 # ============================================================
 
@@ -1175,6 +1262,27 @@ async def on_ready():
 # ============================================================
 
 async def main():
+
+    # Fail early if FFmpeg is unavailable.
+    try:
+        result = subprocess.run(
+            [FFMPEG, "-version"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        first_line = (result.stdout or "").splitlines()
+        logger.info(
+            "FFmpeg check: %s",
+            first_line[0] if first_line else "FFmpeg responded."
+        )
+    except Exception as e:
+        logger.error(
+            "FFmpeg check failed: %s",
+            e
+        )
 
     await bot.add_cog(
         Music(bot)
