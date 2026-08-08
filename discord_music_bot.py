@@ -17,7 +17,7 @@ intents.voice_states = True
 
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-# YouTube DL configuration
+# YouTube DL configuration with better headers and anti-bot detection
 ytdl_format_options = {
     'format': 'bestaudio/best',
     'noplaylist': True,
@@ -25,6 +25,16 @@ ytdl_format_options = {
     'quiet': False,
     'no_warnings': False,
     'socket_timeout': 30,
+    'http_headers': {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept-Language': 'en-US,en;q=0.9',
+    },
+    'extractor_args': {
+        'youtube': {
+            'player_client': ['web'],
+            'player_skip': ['js', 'configs'],
+        }
+    },
 }
 
 ytdl = yt_dlp.YoutubeDL(ytdl_format_options)
@@ -124,7 +134,8 @@ class Music(commands.Cog):
         async with ctx.typing():
             try:
                 logger.info(f"Searching for: {search}")
-                # Extract info
+                
+                # Extract info with better error handling
                 data = await asyncio.get_event_loop().run_in_executor(
                     None,
                     lambda: ytdl.extract_info(search, download=False)
