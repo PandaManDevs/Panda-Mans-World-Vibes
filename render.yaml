@@ -1,0 +1,11 @@
+services:
+  - type: worker
+    name: panda-mans-world-vibes
+    runtime: python
+    buildCommand: bash build.sh
+    startCommand: python discord_music_bot.py
+    envVars:
+      - key: DISCORD_TOKEN
+        sync: false
+      - key: SOUNDCLOUD_CLIENT_ID
+        sync: false
