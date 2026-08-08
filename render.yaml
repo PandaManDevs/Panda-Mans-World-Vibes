@@ -7,5 +7,3 @@ services:
     envVars:
       - key: DISCORD_TOKEN
         sync: false
-      - key: SOUNDCLOUD_CLIENT_ID
-        sync: false
